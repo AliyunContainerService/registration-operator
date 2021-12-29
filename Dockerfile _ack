@@ -8,6 +8,5 @@ FROM registry.cn-hangzhou.aliyuncs.com/acs/centos:7-base
 ENV USER_UID=99
 
 COPY --from=builder /go/src/open-cluster-management.io/registration-operator/registration-operator /
-RUN microdnf update && microdnf clean all
 
 USER ${USER_UID}
