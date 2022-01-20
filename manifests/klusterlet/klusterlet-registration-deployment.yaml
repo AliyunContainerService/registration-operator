@@ -57,6 +57,7 @@ spec:
             drop:
               - ALL
           privileged: false
+          readOnlyRootFilesystem: true
           runAsNonRoot: true
         volumeMounts:
         - name: bootstrap-secret
@@ -64,6 +65,8 @@ spec:
           readOnly: true
         - name: hub-kubeconfig
           mountPath: "/spoke/hub-kubeconfig"
+        - mountPath: /tmp
+          name: tmp
         livenessProbe:
           httpGet:
             path: /healthz
@@ -81,6 +84,9 @@ spec:
           requests:
             cpu: 100m
             memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
       volumes:
       - name: bootstrap-secret
         secret:
@@ -88,3 +94,6 @@ spec:
       - name: hub-kubeconfig
         emptyDir:
           medium: Memory
+      - name: tmp
+        emptyDir:
+          sizeLimit: "50Mi"
