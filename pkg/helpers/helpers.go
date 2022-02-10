@@ -2,6 +2,7 @@ package helpers
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"reflect"
 
@@ -22,6 +23,8 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes"
 	admissionclient "k8s.io/client-go/kubernetes/typed/admissionregistration/v1"
+	coreclientv1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
 	restclient "k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
@@ -191,11 +194,23 @@ func CleanUpStaticObject(
 	case *rbacv1.RoleBinding:
 		err = client.RbacV1().RoleBindings(t.Namespace).Delete(ctx, t.Name, metav1.DeleteOptions{})
 	case *apiextensionsv1.CustomResourceDefinition:
-		err = apiExtensionClient.ApiextensionsV1().CustomResourceDefinitions().Delete(ctx, t.Name, metav1.DeleteOptions{})
+		if apiExtensionClient == nil {
+			err = fmt.Errorf("apiExtensionClient is nil")
+		} else {
+			err = apiExtensionClient.ApiextensionsV1().CustomResourceDefinitions().Delete(ctx, t.Name, metav1.DeleteOptions{})
+		}
 	case *apiextensionsv1beta1.CustomResourceDefinition:
-		err = apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Delete(ctx, t.Name, metav1.DeleteOptions{})
+		if apiExtensionClient == nil {
+			err = fmt.Errorf("apiExtensionClient is nil")
+		} else {
+			err = apiExtensionClient.ApiextensionsV1beta1().CustomResourceDefinitions().Delete(ctx, t.Name, metav1.DeleteOptions{})
+		}
 	case *apiregistrationv1.APIService:
-		err = apiRegistrationClient.APIServices().Delete(ctx, t.Name, metav1.DeleteOptions{})
+		if apiRegistrationClient == nil {
+			err = fmt.Errorf("apiRegistrationClient is nil")
+		} else {
+			err = apiRegistrationClient.APIServices().Delete(ctx, t.Name, metav1.DeleteOptions{})
+		}
 	case *admissionv1.ValidatingWebhookConfiguration:
 		err = client.AdmissionregistrationV1().ValidatingWebhookConfigurations().Delete(ctx, t.Name, metav1.DeleteOptions{})
 	case *admissionv1.MutatingWebhookConfiguration:
@@ -334,12 +349,21 @@ func ApplyDirectly(
 			result.Result, result.Changed, result.Error = ApplyMutatingWebhookConfiguration(
 				client.AdmissionregistrationV1(), t)
 		case *apiregistrationv1.APIService:
-			result.Result, result.Changed, result.Error = resourceapply.ApplyAPIService(apiRegistrationClient, recorder, t)
+			if apiRegistrationClient == nil {
+				result.Error = fmt.Errorf("apiRegistrationClient is nil")
+			} else {
+				t.ObjectMeta.Annotations = make(map[string]string)
+				checksum := fmt.Sprintf("%x", sha256.Sum256(t.Spec.CABundle))
+				t.ObjectMeta.Annotations["caBundle-checksum"] = string(checksum[:]) // to trigger the update when caBundle changed
+				result.Result, result.Changed, result.Error = resourceapply.ApplyAPIService(apiRegistrationClient, recorder, t)
+			}
 		default:
 			genericApplyFiles = append(genericApplyFiles, file)
 		}
+		if result.Error != nil {
+			ret = append(ret, result)
+		}
 	}
-
 	clientHolder := resourceapply.NewKubeClientHolder(client).WithAPIExtensionsClient(apiExtensionClient)
 	applyResults := resourceapply.ApplyDirectly(
 		clientHolder,
@@ -573,7 +597,6 @@ func SetRelatedResourcesStatusesWithObj(
 		return
 	}
 	SetRelatedResourcesStatuses(relatedResourcesStatuses, res)
-	return
 }
 
 func UpdateClusterManagerRelatedResourcesFn(relatedResources ...operatorapiv1.RelatedResourceMeta) UpdateClusterManagerStatusFunc {
@@ -591,5 +614,102 @@ func UpdateKlusterletRelatedResourcesFn(relatedResources ...operatorapiv1.Relate
 			oldStatus.RelatedResources = relatedResources
 		}
 		return nil
+	}
+}
+
+// KlusterletNamespace returns the klusterletNamespace to deploy the agents.
+// Note in Detached mode, the specNamespace will be ignored.
+func KlusterletNamespace(klusterlet *operatorapiv1.Klusterlet) string {
+	if klusterlet.Spec.DeployOption.Mode == operatorapiv1.InstallModeDetached {
+		return klusterlet.GetName()
+	}
+
+	if len(klusterlet.Spec.Namespace) == 0 {
+		// If namespace is not set, use the default namespace
+		return KlusterletDefaultNamespace
+	}
+
+	return klusterlet.Spec.Namespace
+}
+
+// SyncSecret forked from https://github.com/openshift/library-go/blob/d9cdfbd844ea08465b938c46a16bed2ea23207e4/pkg/operator/resource/resourceapply/core.go#L357,
+// add an addition targetClient parameter to support sync secret to another cluster.
+func SyncSecret(client, targetClient coreclientv1.SecretsGetter, recorder events.Recorder,
+	sourceNamespace, sourceName, targetNamespace, targetName string, ownerRefs []metav1.OwnerReference) (*corev1.Secret, bool, error) {
+	source, err := client.Secrets(sourceNamespace).Get(context.TODO(), sourceName, metav1.GetOptions{})
+	switch {
+	case errors.IsNotFound(err):
+		if _, getErr := targetClient.Secrets(targetNamespace).Get(context.TODO(), targetName, metav1.GetOptions{}); getErr != nil && errors.IsNotFound(getErr) {
+			return nil, true, nil
+		}
+		deleteErr := targetClient.Secrets(targetNamespace).Delete(context.TODO(), targetName, metav1.DeleteOptions{})
+		if errors.IsNotFound(deleteErr) {
+			return nil, false, nil
+		}
+		if deleteErr == nil {
+			recorder.Eventf("TargetSecretDeleted", "Deleted target secret %s/%s because source config does not exist", targetNamespace, targetName)
+			return nil, true, nil
+		}
+		return nil, false, deleteErr
+	case err != nil:
+		return nil, false, err
+	default:
+		if source.Type == corev1.SecretTypeServiceAccountToken {
+
+			// Make sure the token is already present, otherwise we have to wait before creating the target
+			if len(source.Data[corev1.ServiceAccountTokenKey]) == 0 {
+				return nil, false, fmt.Errorf("secret %s/%s doesn't have a token yet", source.Namespace, source.Name)
+			}
+
+			if source.Annotations != nil {
+				// When syncing a service account token we have to remove the SA annotation to disable injection into copies
+				delete(source.Annotations, corev1.ServiceAccountNameKey)
+				// To make it clean, remove the dormant annotations as well
+				delete(source.Annotations, corev1.ServiceAccountUIDKey)
+			}
+
+			// SecretTypeServiceAccountToken implies required fields and injection which we do not want in copies
+			source.Type = corev1.SecretTypeOpaque
+		}
+
+		source.Namespace = targetNamespace
+		source.Name = targetName
+		source.ResourceVersion = ""
+		source.OwnerReferences = ownerRefs
+		return resourceapply.ApplySecret(targetClient, recorder, source)
+	}
+}
+
+// GetHubKubeconfig is used to get the kubeconfig of the hub cluster.
+// If it's Default mode, the kubeconfig of the hub cluster should equal to the management cluster's kubeconfig.
+// If it's Detached mode, the kubeconfig of the hub cluster is stored as a secret under clustermanager namespace.
+func GetHubKubeconfig(ctx context.Context,
+	managementKubeconfig *rest.Config, // this is the kubeconfig of the cluster which controller is running on now.
+	clusternamagerName string,
+	clustermanagerMode operatorapiv1.InstallMode) (*restclient.Config, error) {
+	switch clustermanagerMode {
+	case operatorapiv1.InstallModeDefault:
+		return managementKubeconfig, nil
+	case operatorapiv1.InstallModeDetached:
+		clustermanagerNamespace := ClusterManagerNamespace(clusternamagerName, clustermanagerMode)
+		managementKubeclient, err := kubernetes.NewForConfig(managementKubeconfig)
+		if err != nil {
+			return nil, err
+		}
+
+		// get secret of external kubeconfig
+		secret, err := managementKubeclient.CoreV1().Secrets(clustermanagerNamespace).Get(ctx, ExternalHubKubeConfig, metav1.GetOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		config, err := LoadClientConfigFromSecret(secret)
+		if err != nil {
+			return nil, err
+		}
+
+		return config, nil
+	default:
+		return nil, fmt.Errorf("unsupport install mode: %s", clustermanagerMode)
 	}
 }

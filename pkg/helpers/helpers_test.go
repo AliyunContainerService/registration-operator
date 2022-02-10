@@ -8,8 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/openshift/library-go/pkg/assets"
+	"github.com/openshift/library-go/pkg/operator/events"
 	"github.com/openshift/library-go/pkg/operator/events/eventstesting"
+	"github.com/openshift/library-go/pkg/operator/resource/resourceapply"
 	operatorhelpers "github.com/openshift/library-go/pkg/operator/v1helpers"
 	admissionv1 "k8s.io/api/admissionregistration/v1"
 	appsv1 "k8s.io/api/apps/v1"
@@ -20,10 +23,12 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/diff"
+	"k8s.io/client-go/kubernetes/fake"
 	fakekube "k8s.io/client-go/kubernetes/fake"
 	clientcmdapi "k8s.io/client-go/tools/clientcmd/api"
 	clientcmdlatest "k8s.io/client-go/tools/clientcmd/api/latest"
 	fakeapiregistration "k8s.io/kube-aggregator/pkg/client/clientset_generated/clientset/fake"
+
 	opereatorfake "open-cluster-management.io/api/client/operator/clientset/versioned/fake"
 	operatorapiv1 "open-cluster-management.io/api/operator/v1"
 	"open-cluster-management.io/registration-operator/manifests"
@@ -317,10 +322,12 @@ func TestApplyMutatingWebhookConfiguration(t *testing.T) {
 
 func TestApplyDirectly(t *testing.T) {
 	testcase := []struct {
-		name           string
-		applyFiles     map[string]runtime.Object
-		applyFileNames []string
-		expectErr      bool
+		name                    string
+		applyFiles              map[string]runtime.Object
+		applyFileNames          []string
+		nilapiExtensionClient   bool
+		nilapiRegistratonClient bool
+		expectErr               bool
 	}{
 		{
 			name: "Apply webhooks & apiservice & secret",
@@ -332,6 +339,45 @@ func TestApplyDirectly(t *testing.T) {
 			},
 			applyFileNames: []string{"validatingwebhooks", "mutatingwebhooks", "apiservice", "secret"},
 			expectErr:      false,
+		},
+		{
+			name: "Apply webhooks & apiservice & secret with nil apiRegistrationClient",
+			applyFiles: map[string]runtime.Object{
+				"validatingwebhooks": newUnstructured("admissionregistration.k8s.io/v1", "ValidatingWebhookConfiguration", "", "", map[string]interface{}{"webhooks": []interface{}{}}),
+				"mutatingwebhooks":   newUnstructured("admissionregistration.k8s.io/v1", "MutatingWebhookConfiguration", "", "", map[string]interface{}{"webhooks": []interface{}{}}),
+				"apiservice":         newUnstructured("apiregistration.k8s.io/v1", "APIService", "", "", map[string]interface{}{"spec": map[string]interface{}{"service": map[string]string{"name": "svc1", "namespace": "svc1"}}}),
+				"secret":             newUnstructured("v1", "Secret", "ns1", "n1", map[string]interface{}{"data": map[string]interface{}{"key1": []byte("key1")}}),
+			},
+			applyFileNames:          []string{"validatingwebhooks", "mutatingwebhooks", "apiservice", "secret"},
+			nilapiRegistratonClient: true,
+			expectErr:               true,
+		},
+		{
+			name: "Apply generic resources with nil apiExtensionclient & nil apiRegistrationClient",
+			applyFiles: map[string]runtime.Object{
+				"secret": newUnstructured("v1", "Secret", "ns1", "n1", map[string]interface{}{"data": map[string]interface{}{"key1": []byte("key1")}}),
+			},
+			nilapiExtensionClient:   true,
+			nilapiRegistratonClient: true,
+			applyFileNames:          []string{"secret"},
+			expectErr:               false,
+		},
+		{
+			name: "Apply CRD",
+			applyFiles: map[string]runtime.Object{
+				"crd": newUnstructured("apiextensions.k8s.io/v1beta1", "CustomResourceDefinition", "", "", map[string]interface{}{}),
+			},
+			applyFileNames: []string{"crd"},
+			expectErr:      false,
+		},
+		{
+			name: "Apply CRD with nil apiExtensionClient",
+			applyFiles: map[string]runtime.Object{
+				"crd": newUnstructured("apiextensions.k8s.io/v1beta1", "CustomResourceDefinition", "", "", map[string]interface{}{}),
+			},
+			applyFileNames:        []string{"crd"},
+			nilapiExtensionClient: true,
+			expectErr:             true,
 		},
 		{
 			name: "Apply unhandled object",
@@ -346,20 +392,47 @@ func TestApplyDirectly(t *testing.T) {
 	for _, c := range testcase {
 		t.Run(c.name, func(t *testing.T) {
 			fakeKubeClient := fakekube.NewSimpleClientset()
-			fakeResgistrationClient := fakeapiregistration.NewSimpleClientset()
 			fakeExtensionClient := fakeapiextensions.NewSimpleClientset()
-			results := ApplyDirectly(
-				fakeKubeClient, fakeExtensionClient, fakeResgistrationClient.ApiregistrationV1(),
-				eventstesting.NewTestingEventRecorder(t),
-				func(name string) ([]byte, error) {
-					if c.applyFiles[name] == nil {
-						return nil, fmt.Errorf("Failed to find file")
-					}
+			fakeResgistrationClient := fakeapiregistration.NewSimpleClientset().ApiregistrationV1()
+			fakeApplyFunc := func(name string) ([]byte, error) {
+				if c.applyFiles[name] == nil {
+					return nil, fmt.Errorf("Failed to find file")
+				}
 
-					return json.Marshal(c.applyFiles[name])
-				},
-				c.applyFileNames...,
-			)
+				return json.Marshal(c.applyFiles[name])
+			}
+			var results []resourceapply.ApplyResult
+			switch {
+			case c.nilapiExtensionClient && c.nilapiRegistratonClient:
+				results = ApplyDirectly(
+					fakeKubeClient, nil, nil,
+					eventstesting.NewTestingEventRecorder(t),
+					fakeApplyFunc,
+					c.applyFileNames...,
+				)
+			case c.nilapiExtensionClient:
+				results = ApplyDirectly(
+					fakeKubeClient, nil, fakeResgistrationClient,
+					eventstesting.NewTestingEventRecorder(t),
+					fakeApplyFunc,
+					c.applyFileNames...,
+				)
+			case c.nilapiRegistratonClient:
+				results = ApplyDirectly(
+					fakeKubeClient, fakeExtensionClient, nil,
+					eventstesting.NewTestingEventRecorder(t),
+					fakeApplyFunc,
+					c.applyFileNames...,
+				)
+			default:
+				results = ApplyDirectly(
+					fakeKubeClient, fakeExtensionClient, fakeResgistrationClient,
+					eventstesting.NewTestingEventRecorder(t),
+					fakeApplyFunc,
+					c.applyFileNames...,
+				)
+			}
+
 			aggregatedErr := []error{}
 			for _, r := range results {
 				if r.Error != nil {
@@ -368,7 +441,7 @@ func TestApplyDirectly(t *testing.T) {
 			}
 
 			if len(aggregatedErr) == 0 && c.expectErr {
-				t.Errorf("Expect an apply error")
+				t.Errorf("Expect an apply error: %s", c.name)
 			}
 			if len(aggregatedErr) != 0 && !c.expectErr {
 				t.Errorf("Expect no apply error, %v", operatorhelpers.NewMultiLineAggregate(aggregatedErr))
@@ -387,9 +460,11 @@ func TestDeleteStaticObject(t *testing.T) {
 		"kind1":              newUnstructured("v1", "Kind1", "ns1", "n1", map[string]interface{}{"spec": map[string]interface{}{"key1": []byte("key1")}}),
 	}
 	testcase := []struct {
-		name          string
-		applyFileName string
-		expectErr     bool
+		name                     string
+		applyFileName            string
+		expectErr                bool
+		nilapiExtensionClient    bool
+		nilapiRegistrationClient bool
 	}{
 		{
 			name:          "Delete validating webhooks",
@@ -407,6 +482,12 @@ func TestDeleteStaticObject(t *testing.T) {
 			expectErr:     false,
 		},
 		{
+			name:                     "Delete apiservice with nil apiRegistrationClient",
+			applyFileName:            "apiservice",
+			nilapiRegistrationClient: true,
+			expectErr:                true,
+		},
+		{
 			name:          "Delete secret",
 			applyFileName: "secret",
 			expectErr:     false,
@@ -415,6 +496,12 @@ func TestDeleteStaticObject(t *testing.T) {
 			name:          "Delete crd",
 			applyFileName: "crd",
 			expectErr:     false,
+		},
+		{
+			name:                  "Delete crd with nil apiExtensionClient",
+			applyFileName:         "crd",
+			nilapiExtensionClient: true,
+			expectErr:             true,
 		},
 		{
 			name:          "Delete unhandled object",
@@ -426,20 +513,47 @@ func TestDeleteStaticObject(t *testing.T) {
 	for _, c := range testcase {
 		t.Run(c.name, func(t *testing.T) {
 			fakeKubeClient := fakekube.NewSimpleClientset()
-			fakeResgistrationClient := fakeapiregistration.NewSimpleClientset()
+			fakeResgistrationClient := fakeapiregistration.NewSimpleClientset().ApiregistrationV1()
 			fakeExtensionClient := fakeapiextensions.NewSimpleClientset()
-			err := CleanUpStaticObject(
-				context.TODO(),
-				fakeKubeClient, fakeExtensionClient, fakeResgistrationClient.ApiregistrationV1(),
-				func(name string) ([]byte, error) {
-					if applyFiles[name] == nil {
-						return nil, fmt.Errorf("Failed to find file")
-					}
+			fakeAssetFunc := func(name string) ([]byte, error) {
+				if applyFiles[name] == nil {
+					return nil, fmt.Errorf("Failed to find file")
+				}
 
-					return json.Marshal(applyFiles[name])
-				},
-				c.applyFileName,
-			)
+				return json.Marshal(applyFiles[name])
+			}
+
+			var err error
+			switch {
+			case c.nilapiExtensionClient && c.nilapiRegistrationClient:
+				err = CleanUpStaticObject(
+					context.TODO(),
+					fakeKubeClient, nil, nil,
+					fakeAssetFunc,
+					c.applyFileName,
+				)
+			case c.nilapiExtensionClient:
+				err = CleanUpStaticObject(
+					context.TODO(),
+					fakeKubeClient, nil, fakeResgistrationClient,
+					fakeAssetFunc,
+					c.applyFileName,
+				)
+			case c.nilapiRegistrationClient:
+				err = CleanUpStaticObject(
+					context.TODO(),
+					fakeKubeClient, fakeExtensionClient, nil,
+					fakeAssetFunc,
+					c.applyFileName,
+				)
+			default:
+				err = CleanUpStaticObject(
+					context.TODO(),
+					fakeKubeClient, fakeExtensionClient, fakeResgistrationClient,
+					fakeAssetFunc,
+					c.applyFileName,
+				)
+			}
 
 			if err == nil && c.expectErr {
 				t.Errorf("Expect an apply error")
@@ -712,13 +826,13 @@ func TestApplyDeployment(t *testing.T) {
 		{
 			name:                "Apply a deployment without nodePlacement",
 			deploymentName:      "cluster-manager-registration-controller",
-			deploymentNamespace: "open-cluster-management-hub",
+			deploymentNamespace: ClusterManagerDefaultNamespace,
 			expectErr:           false,
 		},
 		{
 			name:                "Apply a deployment with nodePlacement",
 			deploymentName:      "cluster-manager-registration-controller",
-			deploymentNamespace: "open-cluster-management-hub",
+			deploymentNamespace: ClusterManagerDefaultNamespace,
 			nodePlacement: operatorapiv1.NodePlacement{
 				NodeSelector: map[string]string{"node-role.kubernetes.io/infra": ""},
 				Tolerations: []corev1.Toleration{
@@ -763,29 +877,21 @@ func TestApplyDeployment(t *testing.T) {
 	}
 }
 
-type config struct {
-	ClusterManagerName             string
-	RegistrationImage              string
-	RegistrationAPIServiceCABundle string
-	WorkImage                      string
-	WorkAPIServiceCABundle         string
-	PlacementImage                 string
-	Replica                        int32
-}
-
 func TestGetRelatedResource(t *testing.T) {
 	cases := []struct {
 		name                    string
 		manifestFile            string
-		config                  config
+		config                  manifests.HubConfig
 		expectedErr             error
 		expectedRelatedResource operatorapiv1.RelatedResourceMeta
 	}{
 		{
 			name:         "get correct crd relatedResources",
 			manifestFile: "cluster-manager/0000_00_addon.open-cluster-management.io_clustermanagementaddons.crd.yaml",
-
-			config:      config{ClusterManagerName: "test", Replica: 1},
+			config: manifests.HubConfig{
+				ClusterManagerName: "test",
+				Replica:            1,
+			},
 			expectedErr: nil,
 			expectedRelatedResource: operatorapiv1.RelatedResourceMeta{
 				Group:     "apiextensions.k8s.io",
@@ -798,8 +904,11 @@ func TestGetRelatedResource(t *testing.T) {
 		{
 			name:         "get correct clusterrole relatedResources",
 			manifestFile: "cluster-manager/cluster-manager-registration-clusterrole.yaml",
-			config:       config{ClusterManagerName: "test", Replica: 1},
-			expectedErr:  nil,
+			config: manifests.HubConfig{
+				ClusterManagerName: "test",
+				Replica:            1,
+			},
+			expectedErr: nil,
 			expectedRelatedResource: operatorapiv1.RelatedResourceMeta{
 				Group:     "rbac.authorization.k8s.io",
 				Version:   "v1",
@@ -811,13 +920,17 @@ func TestGetRelatedResource(t *testing.T) {
 		{
 			name:         "get correct deployment relatedResources",
 			manifestFile: "cluster-manager/cluster-manager-registration-deployment.yaml",
-			config:       config{ClusterManagerName: "test", Replica: 1},
-			expectedErr:  nil,
+			config: manifests.HubConfig{
+				ClusterManagerName:      "test",
+				ClusterManagerNamespace: "test-namespace",
+				Replica:                 1,
+			},
+			expectedErr: nil,
 			expectedRelatedResource: operatorapiv1.RelatedResourceMeta{
 				Group:     "apps",
 				Version:   "v1",
 				Resource:  "deployments",
-				Namespace: "open-cluster-management-hub",
+				Namespace: "test-namespace",
 				Name:      "test-registration-controller",
 			},
 		},
@@ -920,6 +1033,238 @@ func TestUpdateRelatedResources(t *testing.T) {
 
 			if !equality.Semantic.DeepEqual(klusterletstatus.RelatedResources, c.newRelatedResources) {
 				t.Errorf(diff.ObjectDiff(klusterletstatus.RelatedResources, c.newRelatedResources))
+			}
+		})
+	}
+}
+
+func TestKlusterletNamespace(t *testing.T) {
+	testcases := []struct {
+		name       string
+		klusterlet *operatorapiv1.Klusterlet
+		expect     string
+	}{
+		{
+			name: "Default mode without spec namespace",
+			klusterlet: &operatorapiv1.Klusterlet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "klusterlet",
+				},
+				Spec: operatorapiv1.KlusterletSpec{
+					Namespace:    "",
+					DeployOption: operatorapiv1.DeployOption{},
+				}},
+			expect: KlusterletDefaultNamespace,
+		},
+		{
+			name: "Default mode with spec namespace",
+			klusterlet: &operatorapiv1.Klusterlet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "klusterlet",
+				},
+				Spec: operatorapiv1.KlusterletSpec{
+					Namespace:    "open-cluster-management-test",
+					DeployOption: operatorapiv1.DeployOption{},
+				}},
+			expect: "open-cluster-management-test",
+		},
+		{
+			name: "Detached mode with spec namespace",
+			klusterlet: &operatorapiv1.Klusterlet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "klusterlet",
+				},
+				Spec: operatorapiv1.KlusterletSpec{
+					Namespace:    "open-cluster-management-test",
+					DeployOption: operatorapiv1.DeployOption{Mode: operatorapiv1.InstallModeDetached},
+				},
+			},
+			expect: "klusterlet",
+		},
+		{
+			name: "Detached mode without spec namespace",
+			klusterlet: &operatorapiv1.Klusterlet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "klusterlet",
+				},
+				Spec: operatorapiv1.KlusterletSpec{
+					Namespace:    "",
+					DeployOption: operatorapiv1.DeployOption{Mode: operatorapiv1.InstallModeDetached},
+				},
+			},
+			expect: "klusterlet",
+		},
+	}
+
+	for _, c := range testcases {
+		t.Run(c.name, func(t *testing.T) {
+			namespace := KlusterletNamespace(c.klusterlet)
+			if namespace != c.expect {
+				t.Errorf("Expect namespace %v, got %v", c.expect, namespace)
+			}
+		})
+	}
+}
+
+func TestSyncSecret(t *testing.T) {
+	tt := []struct {
+		name                        string
+		sourceNamespace, sourceName string
+		targetNamespace, targetName string
+		ownerRefs                   []metav1.OwnerReference
+		existingObjects             []runtime.Object
+		expectedSecret              *corev1.Secret
+		expectedChanged             bool
+		expectedErr                 error
+	}{
+		{
+			name:            "syncing existing secret succeeds when the target is missing",
+			sourceNamespace: "sourceNamespace",
+			sourceName:      "sourceName",
+			targetNamespace: "targetNamespace",
+			targetName:      "targetName",
+			ownerRefs:       nil,
+			existingObjects: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "sourceNamespace",
+						Name:      "sourceName",
+					},
+					Type: corev1.SecretTypeOpaque,
+					Data: map[string][]byte{"foo": []byte("bar")},
+				},
+			},
+			expectedSecret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "targetNamespace",
+					Name:      "targetName",
+				},
+				Type: corev1.SecretTypeOpaque,
+				Data: map[string][]byte{"foo": []byte("bar")},
+			},
+			expectedChanged: true,
+			expectedErr:     nil,
+		},
+		{
+			name:            "syncing existing secret succeeds when the target is present and needs update",
+			sourceNamespace: "sourceNamespace",
+			sourceName:      "sourceName",
+			targetNamespace: "targetNamespace",
+			targetName:      "targetName",
+			ownerRefs:       nil,
+			existingObjects: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "sourceNamespace",
+						Name:      "sourceName",
+					},
+					Type: corev1.SecretTypeOpaque,
+					Data: map[string][]byte{"foo": []byte("bar2")},
+				},
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "targetNamespace",
+						Name:      "targetName",
+					},
+					Type: corev1.SecretTypeOpaque,
+					Data: map[string][]byte{"foo": []byte("bar1")},
+				},
+			},
+			expectedSecret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "targetNamespace",
+					Name:      "targetName",
+				},
+				Type: corev1.SecretTypeOpaque,
+				Data: map[string][]byte{"foo": []byte("bar2")},
+			},
+			expectedChanged: true,
+			expectedErr:     nil,
+		},
+		{
+			name:            "syncing missing source secret doesn't fail",
+			sourceNamespace: "sourceNamespace",
+			sourceName:      "sourceName",
+			targetNamespace: "targetNamespace",
+			targetName:      "targetName",
+			ownerRefs:       nil,
+			existingObjects: []runtime.Object{},
+			expectedSecret:  nil,
+			expectedChanged: true,
+			expectedErr:     nil,
+		},
+		{
+			name:            "syncing service account token doesn't sync without the token being present",
+			sourceNamespace: "sourceNamespace",
+			sourceName:      "sourceName",
+			targetNamespace: "targetNamespace",
+			targetName:      "targetName",
+			ownerRefs:       nil,
+			existingObjects: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "sourceNamespace",
+						Name:      "sourceName",
+					},
+					Type: corev1.SecretTypeServiceAccountToken,
+					Data: map[string][]byte{"foo": []byte("bar")},
+				},
+			},
+			expectedSecret:  nil,
+			expectedChanged: false,
+			expectedErr:     fmt.Errorf("secret sourceNamespace/sourceName doesn't have a token yet"),
+		},
+		{
+			name:            "syncing service account token strips \"managed\" annotations",
+			sourceNamespace: "sourceNamespace",
+			sourceName:      "sourceName",
+			targetNamespace: "targetNamespace",
+			targetName:      "targetName",
+			ownerRefs:       nil,
+			existingObjects: []runtime.Object{
+				&corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Namespace: "sourceNamespace",
+						Name:      "sourceName",
+						Annotations: map[string]string{
+							corev1.ServiceAccountNameKey: "foo",
+							corev1.ServiceAccountUIDKey:  "bar",
+						},
+					},
+					Type: corev1.SecretTypeServiceAccountToken,
+					Data: map[string][]byte{"token": []byte("top-secret")},
+				},
+			},
+			expectedSecret: &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "targetNamespace",
+					Name:      "targetName",
+				},
+				Type: corev1.SecretTypeOpaque,
+				Data: map[string][]byte{"token": []byte("top-secret")},
+			},
+			expectedChanged: true,
+			expectedErr:     nil,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			client := fake.NewSimpleClientset(tc.existingObjects...)
+			clientTarget := fake.NewSimpleClientset()
+			secret, changed, err := SyncSecret(client.CoreV1(), clientTarget.CoreV1(), events.NewInMemoryRecorder("test"), tc.sourceNamespace, tc.sourceName, tc.targetNamespace, tc.targetName, tc.ownerRefs)
+
+			if !reflect.DeepEqual(err, tc.expectedErr) {
+				t.Errorf("%s: expected error %v, got %v", tc.name, tc.expectedErr, err)
+				return
+			}
+
+			if !equality.Semantic.DeepEqual(secret, tc.expectedSecret) {
+				t.Errorf("%s: secrets differ: %s", tc.name, cmp.Diff(tc.expectedSecret, secret))
+			}
+
+			if changed != tc.expectedChanged {
+				t.Errorf("%s: expected changed %t, got %t", tc.name, tc.expectedChanged, changed)
 			}
 		})
 	}

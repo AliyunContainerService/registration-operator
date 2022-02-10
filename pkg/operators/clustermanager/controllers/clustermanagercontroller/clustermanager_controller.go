@@ -36,6 +36,7 @@ var (
 		"manifestworks.work.open-cluster-management.io",
 		"managedclusters.cluster.open-cluster-management.io",
 	}
+
 	staticResourceFiles = []string{
 		"cluster-manager/0000_00_addon.open-cluster-management.io_clustermanagementaddons.crd.yaml",
 		"cluster-manager/0000_00_clusters.open-cluster-management.io_managedclusters.crd.yaml",
@@ -43,8 +44,9 @@ var (
 		"cluster-manager/0000_00_work.open-cluster-management.io_manifestworks.crd.yaml",
 		"cluster-manager/0000_01_addon.open-cluster-management.io_managedclusteraddons.crd.yaml",
 		"cluster-manager/0000_01_clusters.open-cluster-management.io_managedclustersetbindings.crd.yaml",
-		"cluster-manager/0000_03_clusters.open-cluster-management.io_placements.crd.yaml",
-		"cluster-manager/0000_04_clusters.open-cluster-management.io_placementdecisions.crd.yaml",
+		"cluster-manager/0000_02_clusters.open-cluster-management.io_placements.crd.yaml",
+		"cluster-manager/0000_03_clusters.open-cluster-management.io_placementdecisions.crd.yaml",
+		"cluster-manager/0000_05_clusters.open-cluster-management.io_addonplacementscores.crd.yaml",
 		"cluster-manager/cluster-manager-registration-clusterrole.yaml",
 		"cluster-manager/cluster-manager-registration-clusterrolebinding.yaml",
 		"cluster-manager/cluster-manager-namespace.yaml",
@@ -53,7 +55,6 @@ var (
 		"cluster-manager/cluster-manager-registration-webhook-clusterrolebinding.yaml",
 		"cluster-manager/cluster-manager-registration-webhook-service.yaml",
 		"cluster-manager/cluster-manager-registration-webhook-serviceaccount.yaml",
-		"cluster-manager/cluster-manager-registration-webhook-apiservice.yaml",
 		"cluster-manager/cluster-manager-registration-webhook-clustersetbinding-validatingconfiguration.yaml",
 		"cluster-manager/cluster-manager-registration-webhook-validatingconfiguration.yaml",
 		"cluster-manager/cluster-manager-registration-webhook-mutatingconfiguration.yaml",
@@ -61,11 +62,16 @@ var (
 		"cluster-manager/cluster-manager-work-webhook-clusterrolebinding.yaml",
 		"cluster-manager/cluster-manager-work-webhook-service.yaml",
 		"cluster-manager/cluster-manager-work-webhook-serviceaccount.yaml",
-		"cluster-manager/cluster-manager-work-webhook-apiservice.yaml",
 		"cluster-manager/cluster-manager-work-webhook-validatingconfiguration.yaml",
 		"cluster-manager/cluster-manager-placement-clusterrole.yaml",
 		"cluster-manager/cluster-manager-placement-clusterrolebinding.yaml",
 		"cluster-manager/cluster-manager-placement-serviceaccount.yaml",
+	}
+
+	// apiserviceResoruceFiles requires CABundle in HubConfig
+	apiserviceResoruceFiles = []string{
+		"cluster-manager/cluster-manager-work-webhook-apiservice.yaml",
+		"cluster-manager/cluster-manager-registration-webhook-apiservice.yaml",
 	}
 
 	deploymentFiles = []string{
@@ -89,7 +95,6 @@ type clusterManagerController struct {
 	kubeClient            kubernetes.Interface
 	apiExtensionClient    apiextensionsclient.Interface
 	apiRegistrationClient apiregistrationclient.APIServicesGetter
-	currentGeneration     []int64
 	configMapLister       corev1listers.ConfigMapLister
 }
 
@@ -110,7 +115,6 @@ func NewClusterManagerController(
 		clusterManagerClient:  clusterManagerClient,
 		clusterManagerLister:  clusterManagerInformer.Lister(),
 		configMapLister:       configMapInformer.Lister(),
-		currentGeneration:     make([]int64, len(deploymentFiles)),
 	}
 
 	return factory.New().WithSync(controller.sync).
@@ -120,9 +124,6 @@ func NewClusterManagerController(
 			helpers.ClusterManagerConfigmapQueueKeyFunc(controller.clusterManagerLister),
 			func(obj interface{}) bool {
 				accessor, _ := meta.Accessor(obj)
-				if namespace := accessor.GetNamespace(); namespace != helpers.ClusterManagerNamespace {
-					return false
-				}
 				if name := accessor.GetName(); name != caBundleConfigmap {
 					return false
 				}
@@ -134,17 +135,6 @@ func NewClusterManagerController(
 			return accessor.GetName()
 		}, clusterManagerInformer.Informer()).
 		ToController("ClusterManagerController", recorder)
-}
-
-// hubConfig is used to render the template of hub manifests
-type hubConfig struct {
-	ClusterManagerName             string
-	RegistrationImage              string
-	RegistrationAPIServiceCABundle string
-	WorkImage                      string
-	WorkAPIServiceCABundle         string
-	PlacementImage                 string
-	Replica                        int32
 }
 
 func (n *clusterManagerController) sync(ctx context.Context, controllerContext factory.SyncContext) error {
@@ -160,13 +150,15 @@ func (n *clusterManagerController) sync(ctx context.Context, controllerContext f
 		return err
 	}
 	clusterManager = clusterManager.DeepCopy()
+	clusterManagerNamespace := helpers.ClusterManagerNamespace(clusterManagerName, clusterManager.Spec.DeployOption.Mode)
 
-	config := hubConfig{
-		ClusterManagerName: clusterManager.Name,
-		RegistrationImage:  clusterManager.Spec.RegistrationImagePullSpec,
-		WorkImage:          clusterManager.Spec.WorkImagePullSpec,
-		PlacementImage:     clusterManager.Spec.PlacementImagePullSpec,
-		Replica:            helpers.DetermineReplicaByNodes(ctx, n.kubeClient),
+	config := manifests.HubConfig{
+		ClusterManagerName:      clusterManager.Name,
+		ClusterManagerNamespace: clusterManagerNamespace,
+		RegistrationImage:       clusterManager.Spec.RegistrationImagePullSpec,
+		WorkImage:               clusterManager.Spec.WorkImagePullSpec,
+		PlacementImage:          clusterManager.Spec.PlacementImagePullSpec,
+		Replica:                 helpers.DetermineReplicaByNodes(ctx, n.kubeClient),
 	}
 
 	// Update finalizer at first
@@ -193,25 +185,8 @@ func (n *clusterManagerController) sync(ctx context.Context, controllerContext f
 		return n.removeClusterManagerFinalizer(ctx, clusterManager)
 	}
 
-	// try to load ca bundle from configmap
-	caBundle := "placeholder"
-	configmap, err := n.configMapLister.ConfigMaps(helpers.ClusterManagerNamespace).Get(caBundleConfigmap)
-	switch {
-	case errors.IsNotFound(err):
-		// do nothing
-	case err != nil:
-		return err
-	default:
-		if cb := configmap.Data["ca-bundle.crt"]; len(cb) > 0 {
-			caBundle = cb
-		}
-	}
-	encodedCaBundle := base64.StdEncoding.EncodeToString([]byte(caBundle))
-	config.RegistrationAPIServiceCABundle = encodedCaBundle
-	config.WorkAPIServiceCABundle = encodedCaBundle
-
+	// Apply static files(Which don't require CABundle)
 	var relatedResources []operatorapiv1.RelatedResourceMeta
-	// Apply static files
 	resourceResults := helpers.ApplyDirectly(
 		n.kubeClient,
 		n.apiExtensionClient,
@@ -230,6 +205,48 @@ func (n *clusterManagerController) sync(ctx context.Context, controllerContext f
 	)
 	errs := []error{}
 	for _, result := range resourceResults {
+		if result.Error != nil {
+			errs = append(errs, fmt.Errorf("%q (%T): %v", result.File, result.Type, result.Error))
+		}
+	}
+
+	// try to load ca bundle from configmap
+	// if the namespace not found yet, skip this and apply static resources first
+	caBundle := "placeholder"
+	configmap, err := n.configMapLister.ConfigMaps(clusterManagerNamespace).Get(caBundleConfigmap)
+	switch {
+	case errors.IsNotFound(err):
+		// do nothing
+	case err != nil:
+		return err
+	default:
+		if cb := configmap.Data["ca-bundle.crt"]; len(cb) > 0 {
+			caBundle = cb
+		}
+	}
+
+	encodedCaBundle := base64.StdEncoding.EncodeToString([]byte(caBundle))
+	config.RegistrationAPIServiceCABundle = encodedCaBundle
+	config.WorkAPIServiceCABundle = encodedCaBundle
+
+	// Apply apiservice files
+	apiserviceResults := helpers.ApplyDirectly(
+		n.kubeClient,
+		n.apiExtensionClient,
+		n.apiRegistrationClient,
+		controllerContext.Recorder(),
+		func(name string) ([]byte, error) {
+			template, err := manifests.ClusterManagerManifestFiles.ReadFile(name)
+			if err != nil {
+				return nil, err
+			}
+			objData := assets.MustCreateAssetFromTemplate(name, template, config).Data
+			helpers.SetRelatedResourcesStatusesWithObj(&relatedResources, objData)
+			return objData, nil
+		},
+		apiserviceResoruceFiles...,
+	)
+	for _, result := range apiserviceResults {
 		if result.Error != nil {
 			errs = append(errs, fmt.Errorf("%q (%T): %v", result.File, result.Type, result.Error))
 		}
@@ -338,7 +355,7 @@ func (n *clusterManagerController) removeCRD(ctx context.Context, name string) e
 }
 
 func (n *clusterManagerController) cleanUp(
-	ctx context.Context, controllerContext factory.SyncContext, config hubConfig) error {
+	ctx context.Context, controllerContext factory.SyncContext, config manifests.HubConfig) error {
 	// Remove crd
 	for _, name := range crdNames {
 		err := n.removeCRD(ctx, name)
@@ -348,8 +365,9 @@ func (n *clusterManagerController) cleanUp(
 		controllerContext.Recorder().Eventf("CRDDeleted", "crd %s is deleted", name)
 	}
 
-	// Remove Static files
-	for _, file := range staticResourceFiles {
+	// Remove All Static files
+	allResourceFiles := append(staticResourceFiles, apiserviceResoruceFiles...)
+	for _, file := range allResourceFiles {
 		err := helpers.CleanUpStaticObject(
 			ctx,
 			n.kubeClient,
@@ -368,5 +386,6 @@ func (n *clusterManagerController) cleanUp(
 			return err
 		}
 	}
+
 	return nil
 }

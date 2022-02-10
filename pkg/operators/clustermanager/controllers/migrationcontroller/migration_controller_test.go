@@ -41,11 +41,7 @@ func TestSupportStorageVersionMigration(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			fakeAPIExtensionClient := fakeapiextensions.NewSimpleClientset(c.existingObjects...)
-			controller := crdMigrationController{
-				apiExtensionClient: fakeAPIExtensionClient,
-			}
-
-			actual, err := controller.supportStorageVersionMigration(context.TODO())
+			actual, err := supportStorageVersionMigration(context.TODO(), fakeAPIExtensionClient)
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -65,11 +61,15 @@ func TestApplyStorageVersionMigrations(t *testing.T) {
 		{
 			name: "created",
 			validateActions: func(t *testing.T, actions []clienttesting.Action) {
-				assertActions(t, actions, "get", "create", "get", "create")
+				assertActions(t, actions, "get", "create", "get", "create", "get", "create", "get", "create")
 				actual := actions[1].(clienttesting.CreateActionImpl).Object
 				assertStorageVersionMigration(t, "managedclustersets.cluster.open-cluster-management.io", actual)
 				actual = actions[3].(clienttesting.CreateActionImpl).Object
 				assertStorageVersionMigration(t, "managedclustersetbindings.cluster.open-cluster-management.io", actual)
+				actual = actions[5].(clienttesting.CreateActionImpl).Object
+				assertStorageVersionMigration(t, "placements.cluster.open-cluster-management.io", actual)
+				actual = actions[7].(clienttesting.CreateActionImpl).Object
+				assertStorageVersionMigration(t, "placementdecisions.cluster.open-cluster-management.io", actual)
 			},
 		},
 		{
@@ -80,13 +80,22 @@ func TestApplyStorageVersionMigrations(t *testing.T) {
 						Name: "managedclustersetbindings.cluster.open-cluster-management.io",
 					},
 				},
+				&migrationv1alpha1.StorageVersionMigration{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "placementdecisions.cluster.open-cluster-management.io",
+					},
+				},
 			},
 			validateActions: func(t *testing.T, actions []clienttesting.Action) {
-				assertActions(t, actions, "get", "create", "get", "update")
+				assertActions(t, actions, "get", "create", "get", "update", "get", "create", "get", "update")
 				actual := actions[1].(clienttesting.CreateActionImpl).Object
 				assertStorageVersionMigration(t, "managedclustersets.cluster.open-cluster-management.io", actual)
 				actual = actions[3].(clienttesting.UpdateActionImpl).Object
 				assertStorageVersionMigration(t, "managedclustersetbindings.cluster.open-cluster-management.io", actual)
+				actual = actions[5].(clienttesting.CreateActionImpl).Object
+				assertStorageVersionMigration(t, "placements.cluster.open-cluster-management.io", actual)
+				actual = actions[7].(clienttesting.UpdateActionImpl).Object
+				assertStorageVersionMigration(t, "placementdecisions.cluster.open-cluster-management.io", actual)
 			},
 		},
 	}
@@ -94,11 +103,8 @@ func TestApplyStorageVersionMigrations(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			fakeMigrationClient := fakemigrationclient.NewSimpleClientset(c.existingObjects...)
-			controller := crdMigrationController{
-				migrationClient: fakeMigrationClient.MigrationV1alpha1(),
-			}
 
-			err := controller.applyStorageVersionMigrations(context.TODO(), eventstesting.NewTestingEventRecorder(t))
+			err := applyStorageVersionMigrations(context.TODO(), fakeMigrationClient.MigrationV1alpha1(), eventstesting.NewTestingEventRecorder(t))
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
@@ -111,6 +117,8 @@ func TestRemoveStorageVersionMigrations(t *testing.T) {
 	names := []string{
 		"managedclustersets.cluster.open-cluster-management.io",
 		"managedclustersetbindings.cluster.open-cluster-management.io",
+		"placements.cluster.open-cluster-management.io",
+		"placementdecisions.cluster.open-cluster-management.io",
 	}
 	cases := []struct {
 		name            string
@@ -128,6 +136,11 @@ func TestRemoveStorageVersionMigrations(t *testing.T) {
 						Name: "managedclustersetbindings.cluster.open-cluster-management.io",
 					},
 				},
+				&migrationv1alpha1.StorageVersionMigration{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: "placementdecisions.cluster.open-cluster-management.io",
+					},
+				},
 			},
 		},
 	}
@@ -135,11 +148,8 @@ func TestRemoveStorageVersionMigrations(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			fakeMigrationClient := fakemigrationclient.NewSimpleClientset(c.existingObjects...)
-			controller := crdMigrationController{
-				migrationClient: fakeMigrationClient.MigrationV1alpha1(),
-			}
 
-			err := controller.applyStorageVersionMigrations(context.TODO(), eventstesting.NewTestingEventRecorder(t))
+			err := applyStorageVersionMigrations(context.TODO(), fakeMigrationClient.MigrationV1alpha1(), eventstesting.NewTestingEventRecorder(t))
 			if err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
