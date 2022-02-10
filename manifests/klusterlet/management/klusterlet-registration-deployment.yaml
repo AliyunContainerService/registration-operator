@@ -63,6 +63,7 @@ spec:
             drop:
               - ALL
           privileged: false
+          readOnlyRootFilesystem: true
           runAsNonRoot: true
         volumeMounts:
         - name: bootstrap-secret
@@ -75,6 +76,8 @@ spec:
           mountPath: "/spoke/config"
           readOnly: true
         {{end}}
+        - mountPath: /tmp
+          name: tmp
         livenessProbe:
           httpGet:
             path: /healthz
@@ -92,6 +95,9 @@ spec:
           requests:
             cpu: 100m
             memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
       volumes:
       - name: bootstrap-secret
         secret:
@@ -104,3 +110,6 @@ spec:
         secret:
           secretName: {{ .ExternalManagedKubeConfigRegistrationSecret }}
       {{end}}
+      - name: tmp
+        emptyDir:
+          sizeLimit: "50Mi"

@@ -59,6 +59,7 @@ spec:
             drop:
               - ALL
           privileged: false
+          readOnlyRootFilesystem: true
           runAsNonRoot: true
         volumeMounts:
         - name: hub-kubeconfig-secret
@@ -69,6 +70,8 @@ spec:
           mountPath: "/spoke/config"
           readOnly: true
         {{end}}
+        - mountPath: /tmp
+          name: tmp
         livenessProbe:
           httpGet:
             path: /healthz
@@ -86,6 +89,9 @@ spec:
           requests:
             cpu: 100m
             memory: 128Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
       volumes:
       - name: hub-kubeconfig-secret
         secret:
@@ -95,3 +101,6 @@ spec:
         secret:
           secretName: {{ .ExternalManagedKubeConfigWorkSecret }}
       {{end}}
+      - name: tmp
+        emptyDir:
+          sizeLimit: "50Mi"

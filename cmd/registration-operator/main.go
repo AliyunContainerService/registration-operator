@@ -3,8 +3,11 @@ package main
 import (
 	goflag "flag"
 	"fmt"
+	"k8s.io/klog/v2"
 	"math/rand"
+	"net/http"
 	"os"
+	log "github.com/sirupsen/logrus"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -17,6 +20,8 @@ import (
 	"open-cluster-management.io/registration-operator/pkg/version"
 )
 
+const defaultHealthzAddr = ":10254"
+
 func main() {
 	rand.Seed(time.Now().UTC().UnixNano())
 
@@ -24,6 +29,9 @@ func main() {
 	pflag.CommandLine.AddGoFlagSet(goflag.CommandLine)
 
 	logs.InitLogs()
+	go func() {
+		startHealthzServer(defaultHealthzAddr)
+	}()
 	defer logs.FlushLogs()
 
 	command := newNucleusCommand()
@@ -53,4 +61,20 @@ func newNucleusCommand() *cobra.Command {
 	cmd.AddCommand(operator.NewKlusterletOperatorCmd())
 
 	return cmd
+}
+
+func startHealthzServer(addr string) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(rw http.ResponseWriter, req *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+	})
+	s := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+	log.Info("start healthz server and listen on", "addr", addr)
+	if err := s.ListenAndServe(); err != nil {
+		log.Error(err, "healthz server cause a error")
+		klog.Fatal(err)
+	}
 }
